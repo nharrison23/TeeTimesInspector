@@ -36,18 +36,18 @@ python -m playwright install chromium
 
 ## Run
 
-For the default Kilworth Springs / IntelligentGolf flow:
+Open a blank browser and navigate manually:
 
 ```bash
 python inspect_booking_flow.py
 ```
 
-For another course, pass the URLs explicitly:
+For a repeat run, optionally pass a start, login, or booking URL:
 
 ```bash
 python inspect_booking_flow.py \
+  --start-url "https://example-club.example" \
   --login-url "https://example-club.example/login" \
-  --consent-url "" \
   --booking-url "https://example-club.example/memberbooking/"
 ```
 
@@ -55,7 +55,7 @@ If the site does not have a separate consent URL, pass `--consent-url ""`.
 
 ## What To Do
 
-1. Log in in the opened browser.
+1. Browse to the club booking site and log in in the opened browser.
 2. Press Enter in the terminal.
 3. Confirm the real booking page is visible, then press Enter again.
 4. In the browser, select date, time, players, and any required options until just before final confirmation.

@@ -37,9 +37,12 @@ except ImportError as exc:  # pragma: no cover - useful local error message
         "  python -m playwright install chromium\n"
     ) from exc
 
-DEFAULT_LOGIN_URL = "https://kilworth.intelligentgolf.co.uk/login.php"
-DEFAULT_CONSENT_URL = "https://kilworth.intelligentgolf.co.uk/ttbconsent.php?action=accept"
-DEFAULT_BOOKING_URL = "https://kilworth.intelligentgolf.co.uk/memberbooking/"
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+
+DEFAULT_START_URL = "about:blank"
 BOOKING_KEYWORDS = (
     "book",
     "booking",
@@ -216,6 +219,8 @@ def has_booking_keywords(text: str | None) -> bool:
 def is_same_domain_or_interesting(url: str, domain: str) -> bool:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
+    if not domain:
+        return parsed.scheme in {"http", "https"} or has_booking_keywords(url)
     return host == domain.lower() or host.endswith("." + domain.lower()) or has_booking_keywords(url)
 
 
@@ -276,12 +281,16 @@ def risky_final_request(request: Request, *, domain: str) -> bool:
         return False
 
     parsed = urlparse(request.url)
-    same_domain = parsed.netloc.lower() == domain.lower() or parsed.netloc.lower().endswith("." + domain.lower())
+    same_domain = (
+        parsed.scheme in {"http", "https"}
+        if not domain
+        else parsed.netloc.lower() == domain.lower() or parsed.netloc.lower().endswith("." + domain.lower())
+    )
     if not same_domain:
         return False
 
-    # IntelligentGolf may create/edit a booking via a GET navigation to
-    # /memberbooking/?...&book=HH:MM:SS&<nonce>=<nonce>, not only via POST.
+    # Some booking sites create/edit a booking via a GET navigation with
+    # booking-like query parameters, not only via POST.
     if request.method.upper() == "GET" and query_has_booking_keys(request.url):
         query_keys = {key.lower() for key in parse_qs(parsed.query, keep_blank_values=True).keys()}
         if "book" in query_keys or "newbooking" in query_keys or "edit" in query_keys:
@@ -551,13 +560,16 @@ def build_report(
 
 
 def main() -> int:
+    if load_dotenv is not None:
+        load_dotenv()
     parser = argparse.ArgumentParser(description="Inspect and redact a tee-time booking flow.")
-    parser.add_argument("--login-url", default=os.getenv("LOGIN_URL", DEFAULT_LOGIN_URL), help="Member login URL to open first.")
-    parser.add_argument("--consent-url", default=os.getenv("CONSENT_URL", DEFAULT_CONSENT_URL), help="Consent acceptance URL to visit after login. Use empty string to skip.")
-    parser.add_argument("--booking-url", default=os.getenv("BOOKING_URL", DEFAULT_BOOKING_URL), help="Member booking URL to open after login/consent.")
+    parser.add_argument("--start-url", default=os.getenv("START_URL", DEFAULT_START_URL), help="Optional URL to open first. Defaults to a blank tab.")
+    parser.add_argument("--login-url", default=os.getenv("LOGIN_URL", ""), help="Optional member login URL to open first.")
+    parser.add_argument("--consent-url", default=os.getenv("CONSENT_URL", ""), help="Optional consent acceptance URL to visit after login. Use empty string to skip.")
+    parser.add_argument("--booking-url", default=os.getenv("BOOKING_URL", ""), help="Optional member booking URL to open after login/consent.")
     parser.add_argument("--url", dest="legacy_url", default=None, help="Deprecated alias for --booking-url.")
     parser.add_argument("--output-dir", default="diagnostics", help="Directory for reports.")
-    parser.add_argument("--storage-state", default=".auth/intelligentgolf_state.json", help="Saved browser session path.")
+    parser.add_argument("--storage-state", default=".auth/tee_times_inspector_state.json", help="Saved browser session path.")
     parser.add_argument("--fresh", action="store_true", help="Ignore any saved browser session and log in fresh.")
     parser.add_argument("--headless", action="store_true", help="Run browser headless. Not recommended for first run.")
     parser.add_argument("--no-final-guard", action="store_true", help="Do not offer to intercept the final booking POST.")
@@ -570,8 +582,8 @@ def main() -> int:
     login_url = args.login_url
     consent_url = args.consent_url
     booking_url = args.legacy_url or args.booking_url
-    start_url = login_url
-    domain = urlparse(booking_url or login_url).netloc
+    start_url = login_url or booking_url or args.start_url
+    domain = urlparse(booking_url or login_url or args.start_url).netloc
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.output_dir) / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -586,9 +598,10 @@ def main() -> int:
 
     print("\nBooking flow inspector")
     print("======================")
-    print(f"Login URL:   {login_url}")
-    print(f"Consent URL: {consent_url or '<skipped>'}")
-    print(f"Booking URL: {booking_url}")
+    print(f"Start URL:   {start_url}")
+    print(f"Login URL:   {login_url or '<manual>'}")
+    print(f"Consent URL: {consent_url or '<skipped/manual>'}")
+    print(f"Booking URL: {booking_url or '<manual>'}")
     print("\nYou will log in and operate the site locally. The report will redact secrets and values.")
     print("Important: do not complete a real booking. The optional final guard can capture and abort a likely final booking request.")
     if not args.no_block_tracking:
@@ -646,11 +659,12 @@ def main() -> int:
         page.on("request", on_request)
         page.on("response", on_response)
 
-        page.goto(login_url, wait_until="domcontentloaded")
+        if start_url != "about:blank":
+            page.goto(start_url, wait_until="domcontentloaded")
 
         wait_for_enter(
             page,
-            "Step 1: log in on the member login page if needed, then press Enter here... ",
+            "Step 1: browse to the club booking site, log in if needed, then press Enter here... ",
         )
         context.storage_state(path=str(storage_state_path))
         print(f"Saved browser session to: {storage_state_path}")
@@ -660,12 +674,13 @@ def main() -> int:
             page.goto(consent_url, wait_until="domcontentloaded")
             page.wait_for_timeout(1000)
 
-        print(f"Opening member booking URL: {booking_url}")
-        page.goto(booking_url, wait_until="domcontentloaded")
+        if booking_url:
+            print(f"Opening member booking URL: {booking_url}")
+            page.goto(booking_url, wait_until="domcontentloaded")
 
         wait_for_enter(
             page,
-            "Step 1b: confirm the real member booking page is visible, then press Enter to continue... ",
+            "Step 1b: browse to or confirm the real member booking page is visible, then press Enter to continue... ",
         )
 
         wait_for_enter(
@@ -707,7 +722,7 @@ def main() -> int:
             start_url=start_url,
             login_url=login_url,
             consent_url=consent_url,
-            booking_url=booking_url,
+            booking_url=booking_url or page.url,
             final_url=final_url,
             requests=captured_requests,
             responses=captured_responses,
